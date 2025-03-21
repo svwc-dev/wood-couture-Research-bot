@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
 # Set API keys from Streamlit secrets
-# This will use secrets.toml in local development and deployed environment variables in production
 SERPER_API_KEY = st.secrets.get("SERPER_API_KEY", None)
 
 # Set page config
@@ -159,31 +158,47 @@ def extract_company_summary_from_search(company_name):
     Returns:
         str: Summary text about the company
     """
+    # First try to get company overview
     query = f"{company_name} company about overview"
     search_results = google_search(query)
     
-    summary = "No information available."
+    summary_texts = []
     
-    if 'organic' in search_results:
-        summary_texts = []
-        
-        # Extract snippets from search results
-        for result in search_results['organic'][:3]:  # Use first 3 results
-            snippet = result.get('snippet', '')
-            if snippet and len(snippet) > 50:  # Ensure we have substantial text
-                summary_texts.append(snippet)
-        
-        # If we have knowledge graph info, use that
-        if 'knowledgeGraph' in search_results:
-            kg = search_results['knowledgeGraph']
-            if 'description' in kg:
-                summary_texts.insert(0, kg['description'])  # Prioritize knowledge graph
+    # Try multiple search queries to get comprehensive information
+    queries = [
+        f"{company_name} company about overview",
+        f"{company_name} about us company description",
+        f"{company_name} company profile business"
+    ]
+    
+    for query in queries:
+        results = google_search(query)
+        if 'organic' in results:
+            # Extract snippets from search results
+            for result in results['organic'][:3]:  #
+                snippet = result.get('snippet', '')
+                if snippet and len(snippet) > 50:  # 
+                    # Clean up the snippet
+                    cleaned_snippet = re.sub(r'\s+', ' ', snippet).strip()
+                    if cleaned_snippet not in summary_texts:  # Avoid duplicates
+                        summary_texts.append(cleaned_snippet)
             
-        # Combine snippets into a summary
-        if summary_texts:
-            summary = " ".join(summary_texts)
+            # If we have knowledge graph info, use that
+            if 'knowledgeGraph' in results:
+                kg = results['knowledgeGraph']
+                if 'description' in kg:
+                    kg_desc = kg['description']
+                    if kg_desc not in summary_texts:
+                        summary_texts.insert(0, kg_desc)  # Prioritize knowledge graph
     
-    return summary
+    if summary_texts:
+        # Combine snippets into a coherent summary
+        summary = " ".join(summary_texts)
+        # Clean up the summary
+        summary = re.sub(r'\s+', ' ', summary).strip()
+        return summary
+    
+    return "No information available."
 
 def find_linkedin_url(company_name):
     """
@@ -248,7 +263,7 @@ def search_specific_company(company_name):
             "summary": summary
         }
 
-def search_multiple_companies(country, search_terms, additional_requirements="", offset=0, max_results=20):
+def search_multiple_companies(country, search_terms, additional_requirements="", offset=0, max_results=20, existing_companies=None):
     """
     Find information for multiple companies based on search criteria.
     
@@ -258,13 +273,17 @@ def search_multiple_companies(country, search_terms, additional_requirements="",
         additional_requirements (str): Additional search requirements
         offset (int): Search result offset
         max_results (int): Maximum number of results to return
+        existing_companies (dict): Existing companies to avoid duplicates when loading more
         
     Returns:
         list: List of company information dictionaries
     """
-    companies = {}
+    companies = existing_companies if existing_companies is not None else {}
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    # Track how many new companies we've found
+    new_companies_count = 0
     
     # Perform searches for each term
     for i, term in enumerate(search_terms):
@@ -309,15 +328,17 @@ def search_multiple_companies(country, search_terms, additional_requirements="",
                     "location": location,
                     "summary": summary
                 }
-            
-            # Update progress
-            progress = min(1.0, len(companies) / max_results)
-            progress_bar.progress(progress)
+                
+                new_companies_count += 1
+                
+                # Update progress based on new companies found
+                progress = min(1.0, new_companies_count / max_results)
+                progress_bar.progress(progress)
 
-            if len(companies) >= max_results:
-                break
+                if new_companies_count >= max_results:
+                    break
         
-        if len(companies) >= max_results:
+        if new_companies_count >= max_results:
             break
 
     if not companies:
@@ -424,6 +445,12 @@ def main():
         if custom_terms.strip():
             search_terms = [term for term in custom_terms.strip().split("\n") if term.strip()]
         
+        # Initialize session state for storing results
+        if 'general_search_results' not in st.session_state:
+            st.session_state.general_search_results = []
+            st.session_state.total_results_loaded = 0
+            st.session_state.search_params = None
+        
         if st.button("🔍 Search for Companies"):
             if not SERPER_API_KEY:
                 st.error("Please configure your SERPER_API_KEY in the secrets.toml file before searching.")
@@ -433,18 +460,34 @@ def main():
             st.write("Using search terms:")
             for term in search_terms:
                 st.write(f"- {term}")
-                
+            
+            # Reset results when starting a new search
+            st.session_state.general_search_results = []
+            st.session_state.total_results_loaded = 0
+            
+            # Store search parameters
+            st.session_state.search_params = {
+                'country': country,
+                'search_terms': search_terms,
+                'requirements': requirements
+            }
+            
+            # Convert existing results to dict for duplicate checking
+            existing_companies = {r['company_name']: r for r in st.session_state.general_search_results}
+            
             results = search_multiple_companies(
                 country, search_terms, additional_requirements=requirements, 
-                offset=offset, max_results=max_results
+                offset=offset, max_results=max_results,
+                existing_companies=existing_companies
             )
             
             if results:
                 st.session_state.general_search_results = results
+                st.session_state.total_results_loaded = len(results)
                 st.success(f"Found {len(results)} companies matching your criteria")
         
         # Display results if they exist
-        if "general_search_results" in st.session_state and st.session_state.general_search_results:
+        if st.session_state.general_search_results:
             st.markdown("---")
             
             # Add export button
@@ -460,6 +503,7 @@ def main():
             with col2:
                 st.subheader("Search Results")
             
+            # Display results
             for i, result in enumerate(st.session_state.general_search_results):
                 with st.expander(f"{i+1}. {result['company_name']}"):
                     col1, col2 = st.columns([1, 1])
@@ -479,6 +523,34 @@ def main():
                     with col2:
                         st.markdown("### Company Summary")
                         st.markdown(result['summary'])
+            
+            # Add "Load More" button if we have search parameters
+            if st.session_state.search_params:
+                if st.button("🔄 Load More Results"):
+                    # Calculate new offset
+                    new_offset = st.session_state.total_results_loaded
+                    
+                    # Convert existing results to dict for duplicate checking
+                    existing_companies = {r['company_name']: r for r in st.session_state.general_search_results}
+                    
+                    # Search for more results
+                    more_results = search_multiple_companies(
+                        st.session_state.search_params['country'],
+                        st.session_state.search_params['search_terms'],
+                        additional_requirements=st.session_state.search_params['requirements'],
+                        offset=new_offset,
+                        max_results=max_results,
+                        existing_companies=existing_companies
+                    )
+                    
+                    if more_results:
+                        # Update results and counter
+                        st.session_state.general_search_results.extend(more_results)
+                        st.session_state.total_results_loaded = len(st.session_state.general_search_results)
+                        st.success(f"Found {len(more_results)} additional companies")
+                        st.experimental_rerun()
+                    else:
+                        st.info("No more results found.")
     
     with tab2:
         st.header("Search for a Specific Company")
